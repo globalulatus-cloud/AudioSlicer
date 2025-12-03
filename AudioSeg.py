@@ -17,11 +17,6 @@ def GetTime(video_seconds):
     d = datetime(1,1,1) + sec
     return f"{str(d.hour).zfill(2)}:{str(d.minute).zfill(2)}:{str(d.second).zfill(2)}.001"
 
-def GetTotalTime(video_seconds):
-    sec = timedelta(seconds=float(video_seconds))
-    d = datetime(1,1,1) + sec
-    return f"{d.hour}:{d.minute}:{d.second}"
-
 def windows(signal, window_size, step_size):
     for i_start in range(0, len(signal), step_size):
         i_end = i_start + window_size
@@ -56,32 +51,44 @@ step_duration = st.number_input("Step Duration (seconds)", value=0.003)
 if uploaded_file is not None:
     st.success("File uploaded successfully!")
 
-    # Save uploaded file safely for Streamlit Cloud
-    temp_dir = "/tmp" if not os.path.exists("temp") else "temp"
+    # ---------------------------
+    # Prepare safe temp directory
+    # ---------------------------
+    temp_dir = "/tmp/slicer"
     os.makedirs(temp_dir, exist_ok=True)
+
     input_path = os.path.join(temp_dir, "input.wav")
 
+    # Save uploaded file
     with open(input_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
 
-    # Output directory
-    output_dir = os.path.join(temp_dir, "splits")
-    os.makedirs(output_dir, exist_ok=True)
-
-    st.write("Processing...")
+    st.write("Processing uploaded audio...")
 
     # ---------------------------------------------------
-    # Silence Detection + Splitting
+    # Read WAV safely (NO mmap - fixes ValueError)
     # ---------------------------------------------------
-    sample_rate, samples = wavfile.read(input_path, mmap=True)
+    try:
+        sample_rate, samples = wavfile.read(input_path)
+    except Exception as e:
+        st.error(f"Error reading WAV file: {e}")
+        st.stop()
 
-    max_amplitude = np.iinfo(samples.dtype).max
-    max_energy = energy([max_amplitude])
+    # Ensure samples are in numpy array form
+    samples = np.array(samples)
 
+    # ---------------------------------------------------
+    # Silence Detection Parameters
+    # ---------------------------------------------------
     window_size = int(min_silence_length * sample_rate)
     step_size = int(step_duration * sample_rate)
 
+    max_amplitude = np.max(np.abs(samples))
+    max_energy = energy([max_amplitude])
+
     signal_windows = windows(samples, window_size, step_size)
+
+    st.write("Detecting silences...")
 
     window_energy = (energy(w) / max_energy for w in tqdm(
         signal_windows,
@@ -97,7 +104,13 @@ if uploaded_file is not None:
 
     cut_ranges = [(i, cut_samples[i], cut_samples[i + 1]) for i in range(len(cut_samples) - 1)]
 
+    # Output folder
+    output_dir = os.path.join(temp_dir, "splits")
+    os.makedirs(output_dir, exist_ok=True)
+
     base_name = uploaded_file.name.replace(".wav", "")
+
+    # Store segment timestamps
     video_sub = {
         str(i): [
             GetTime(cut_samples[i] / sample_rate),
@@ -106,32 +119,41 @@ if uploaded_file is not None:
         for i in range(len(cut_samples) - 1)
     }
 
-    st.write("Splitting audio...")
+    st.write("Splitting audio into segments...")
 
     output_files = []
 
     for i, start, stop in tqdm(cut_ranges):
         output_file_path = os.path.join(output_dir, f"{base_name}_{i:03d}.wav")
-        wavfile.write(output_file_path, sample_rate, samples[start:stop])
+        segment = samples[start:stop]
+
+        wavfile.write(output_file_path, sample_rate, segment)
         output_files.append(output_file_path)
 
-    # Write JSON
+    # Write JSON file
     json_path = os.path.join(output_dir, base_name + ".json")
-    with open(json_path, "w") as output_json:
-        json.dump(video_sub, output_json)
+    with open(json_path, "w") as out_json:
+        json.dump(video_sub, out_json)
 
     st.success("Audio successfully split!")
 
-    # Provide download links
-    st.subheader("Download Files")
+    # ---------------------------------------------------
+    # Download section
+    # ---------------------------------------------------
+    st.subheader("Download Generated Segments")
 
-    for fpath in output_files[:10]:   # Show first 10
+    max_show = min(10, len(output_files))
+    st.write(f"Showing first {max_show} segments:")
+
+    for fpath in output_files[:max_show]:
         with open(fpath, "rb") as fp:
             st.download_button(
                 label=f"Download {os.path.basename(fpath)}",
                 data=fp,
                 file_name=os.path.basename(fpath)
             )
+
+    st.subheader("Download JSON Metadata")
 
     with open(json_path, "rb") as fp:
         st.download_button(
