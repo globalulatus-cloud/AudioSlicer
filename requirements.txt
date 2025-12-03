@@ -1,8 +1,7 @@
-numpy>=1.26.0
-soundfile>=0.12.1
-librosa>=0.10.1
-scipy>=1.11.0
-pydub>=0.25.1
-streamlit>=1.36.0
-whisper-timestamped
+streamlit
+pydub
+numpy
+scipy
+tqdm
 ffmpeg-python
+soundfile
