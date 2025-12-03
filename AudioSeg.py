@@ -1,163 +1,165 @@
 import streamlit as st
 import numpy as np
 import os
-import json
-from scipy.io import wavfile
-from tqdm import tqdm
+from pydub import AudioSegment
 from datetime import datetime, timedelta
+import json
+import zipfile
+import io
+from tqdm import tqdm
 
-# ---------------------------------------------------
+# ------------------------------------------
 # Utility Functions
-# ---------------------------------------------------
+# ------------------------------------------
 
-def GetTime(video_seconds):
-    if video_seconds < 0:
-        return "00:00:00.000"
-    sec = timedelta(seconds=float(video_seconds))
-    d = datetime(1,1,1) + sec
-    return f"{str(d.hour).zfill(2)}:{str(d.minute).zfill(2)}:{str(d.second).zfill(2)}.001"
+def format_time(ms):
+    """Format milliseconds into HH:MM:SS.sss"""
+    sec = ms / 1000
+    d = datetime(1,1,1) + timedelta(seconds=sec)
+    return f"{d.hour:02d}:{d.minute:02d}:{d.second:02d}.{int(ms%1000):03d}"
 
-def windows(signal, window_size, step_size):
-    for i_start in range(0, len(signal), step_size):
-        i_end = i_start + window_size
-        if i_end >= len(signal):
-            break
-        yield signal[i_start:i_end]
 
-def energy(samples):
-    return np.sum(np.power(samples, 2.0)) / float(len(samples))
+# ------------------------------------------
+# Fast, Chunk-Based Energy Silence Detection
+# ------------------------------------------
 
-def rising_edges(binary_signal):
-    previous_value = 0
-    index = 0
-    for x in binary_signal:
-        if x and not previous_value:
-            yield index
-        previous_value = x
-        index += 1
+def detect_silence_segments(sound, min_silence_ms, threshold, step_ms):
+    """
+    sound           → AudioSegment
+    min_silence_ms  → minimum silent chunk length
+    threshold       → silence threshold (dBFS)
+    step_ms         → step window
+    returns list of (start_ms, end_ms)
+    """
 
-# ---------------------------------------------------
+    silence_starts = []
+    silence_current = None
+
+    for i in range(0, len(sound), step_ms):
+        chunk = sound[i:i + step_ms]
+        if chunk.dBFS < threshold:
+            # silence started
+            if silence_current is None:
+                silence_current = i
+        else:
+            # silence ended
+            if silence_current is not None:
+                duration = i - silence_current
+                if duration >= min_silence_ms:
+                    silence_starts.append((silence_current, i))
+                silence_current = None
+
+    # Handle last segment
+    if silence_current is not None:
+        if len(sound) - silence_current >= min_silence_ms:
+            silence_starts.append((silence_current, len(sound)))
+
+    return silence_starts
+
+
+# ------------------------------------------
 # Streamlit UI
-# ---------------------------------------------------
+# ------------------------------------------
 
-st.title("Audio Silence-Based Splitter")
+st.title("Optimized Audio Silence Splitter (Large File Support)")
 
 uploaded_file = st.file_uploader("Upload WAV file", type=["wav"])
 
-min_silence_length = st.number_input("Min Silence Length (seconds)", value=0.6)
-silence_threshold = st.number_input("Silence Energy Threshold", value=1e-4, format="%.6f")
-step_duration = st.number_input("Step Duration (seconds)", value=0.003)
+min_silence = st.number_input("Min Silence Length (seconds)", value=0.5)
+threshold = st.number_input("Silence Threshold (dBFS)", value=-40.0)
+step = st.number_input("Step Duration (ms)", value=10)
 
 if uploaded_file is not None:
     st.success("File uploaded successfully!")
 
-    # ---------------------------
-    # Prepare safe temp directory
-    # ---------------------------
+    # Save temp
     temp_dir = "/tmp/slicer"
     os.makedirs(temp_dir, exist_ok=True)
-
     input_path = os.path.join(temp_dir, "input.wav")
 
-    # Save uploaded file
     with open(input_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
 
-    st.write("Processing uploaded audio...")
+    st.write("Loading audio (very large files supported)...")
 
-    # ---------------------------------------------------
-    # Read WAV safely (NO mmap - fixes ValueError)
-    # ---------------------------------------------------
-    try:
-        sample_rate, samples = wavfile.read(input_path)
-    except Exception as e:
-        st.error(f"Error reading WAV file: {e}")
-        st.stop()
+    sound = AudioSegment.from_wav(input_path)
 
-    # Ensure samples are in numpy array form
-    samples = np.array(samples)
-
-    # ---------------------------------------------------
-    # Silence Detection Parameters
-    # ---------------------------------------------------
-    window_size = int(min_silence_length * sample_rate)
-    step_size = int(step_duration * sample_rate)
-
-    max_amplitude = np.max(np.abs(samples))
-    max_energy = energy([max_amplitude])
-
-    signal_windows = windows(samples, window_size, step_size)
+    min_silence_ms = int(min_silence * 1000)
+    step_ms = int(step)
 
     st.write("Detecting silences...")
 
-    window_energy = (energy(w) / max_energy for w in tqdm(
-        signal_windows,
-        total=int(len(samples) / float(step_size))
-    ))
+    silence_segments = detect_silence_segments(
+        sound,
+        min_silence_ms=min_silence_ms,
+        threshold=threshold,
+        step_ms=step_ms
+    )
 
-    window_silence = (e > silence_threshold for e in window_energy)
+    st.write(f"Detected {len(silence_segments)} silence points")
 
-    cut_times = (r * step_duration for r in rising_edges(window_silence))
+    # Compute cut points
+    cut_points = [0] + [end for (_, end) in silence_segments] + [len(sound)]
+    cut_points = sorted(set(cut_points))  # remove duplicates
 
-    cut_samples = [int(t * sample_rate) for t in cut_times]
-    cut_samples.append(-1)
+    segments = []
+    for i in range(len(cut_points) - 1):
+        start = cut_points[i]
+        end = cut_points[i+1]
+        segments.append((i, start, end))
 
-    cut_ranges = [(i, cut_samples[i], cut_samples[i + 1]) for i in range(len(cut_samples) - 1)]
+    st.write(f"Total segments created: {len(segments)}")
 
-    # Output folder
+    # ---------------------------------------
+    # Export segments into temp folder
+    # ---------------------------------------
     output_dir = os.path.join(temp_dir, "splits")
     os.makedirs(output_dir, exist_ok=True)
 
-    base_name = uploaded_file.name.replace(".wav", "")
+    json_data = {}
 
-    # Store segment timestamps
-    video_sub = {
-        str(i): [
-            GetTime(cut_samples[i] / sample_rate),
-            GetTime(cut_samples[i + 1] / sample_rate)
-        ]
-        for i in range(len(cut_samples) - 1)
-    }
+    for idx, start, end in segments:
+        seg = sound[start:end]
+        out_path = os.path.join(output_dir, f"{uploaded_file.name[:-4]}_{idx:03d}.wav")
+        seg.export(out_path, format="wav")
 
-    st.write("Splitting audio into segments...")
+        json_data[idx] = {
+            "start": format_time(start),
+            "end": format_time(end)
+        }
 
-    output_files = []
-
-    for i, start, stop in tqdm(cut_ranges):
-        output_file_path = os.path.join(output_dir, f"{base_name}_{i:03d}.wav")
-        segment = samples[start:stop]
-
-        wavfile.write(output_file_path, sample_rate, segment)
-        output_files.append(output_file_path)
-
-    # Write JSON file
-    json_path = os.path.join(output_dir, base_name + ".json")
-    with open(json_path, "w") as out_json:
-        json.dump(video_sub, out_json)
+    # Write metadata JSON
+    json_path = os.path.join(output_dir, uploaded_file.name[:-4] + ".json")
+    with open(json_path, "w") as jf:
+        json.dump(json_data, jf, indent=2)
 
     st.success("Audio successfully split!")
 
-    # ---------------------------------------------------
-    # Download section
-    # ---------------------------------------------------
-    st.subheader("Download Generated Segments")
+    # ---------------------------------------
+    # Create ZIP for download
+    # ---------------------------------------
+    st.subheader("Download All Segments (ZIP)")
 
-    max_show = min(10, len(output_files))
-    st.write(f"Showing first {max_show} segments:")
+    memory_zip = io.BytesIO()
+    with zipfile.ZipFile(memory_zip, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for fname in os.listdir(output_dir):
+            fpath = os.path.join(output_dir, fname)
+            zf.write(fpath, arcname=fname)
 
-    for fpath in output_files[:max_show]:
-        with open(fpath, "rb") as fp:
-            st.download_button(
-                label=f"Download {os.path.basename(fpath)}",
-                data=fp,
-                file_name=os.path.basename(fpath)
-            )
+    memory_zip.seek(0)
+
+    st.download_button(
+        "Download ZIP",
+        data=memory_zip,
+        file_name="audio_segments.zip",
+        mime="application/zip"
+    )
 
     st.subheader("Download JSON Metadata")
 
-    with open(json_path, "rb") as fp:
+    with open(json_path, "rb") as jf:
         st.download_button(
-            label="Download JSON File",
-            data=fp,
+            "Download JSON",
+            data=jf,
             file_name=os.path.basename(json_path)
         )
