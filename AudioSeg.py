@@ -1,40 +1,28 @@
-from scipy.io import wavfile
-import os
+import streamlit as st
 import numpy as np
-import argparse
-from tqdm import tqdm
+import os
 import json
-
+from scipy.io import wavfile
+from tqdm import tqdm
 from datetime import datetime, timedelta
 
-# Utility functions
+# ---------------------------------------------------
+# Utility Functions
+# ---------------------------------------------------
 
 def GetTime(video_seconds):
-
-    if (video_seconds < 0) :
-        return 00
-
-    else:
-        sec = timedelta(seconds=float(video_seconds))
-        d = datetime(1,1,1) + sec
-
-        instant = str(d.hour).zfill(2) + ':' + str(d.minute).zfill(2) + ':' + str(d.second).zfill(2) + str('.001')
-    
-        return instant
-
-def GetTotalTime(video_seconds):
-
+    if video_seconds < 0:
+        return "00:00:00.000"
     sec = timedelta(seconds=float(video_seconds))
     d = datetime(1,1,1) + sec
-    delta = str(d.hour) + ':' + str(d.minute) + ":" + str(d.second)
-    
-    return delta
+    return f"{str(d.hour).zfill(2)}:{str(d.minute).zfill(2)}:{str(d.second).zfill(2)}.001"
+
+def GetTotalTime(video_seconds):
+    sec = timedelta(seconds=float(video_seconds))
+    d = datetime(1,1,1) + sec
+    return f"{d.hour}:{d.minute}:{d.second}"
 
 def windows(signal, window_size, step_size):
-    if type(window_size) is not int:
-        raise AttributeError("Window size must be an integer.")
-    if type(step_size) is not int:
-        raise AttributeError("Step size must be an integer.")
     for i_start in range(0, len(signal), step_size):
         i_end = i_start + window_size
         if i_end >= len(signal):
@@ -42,7 +30,7 @@ def windows(signal, window_size, step_size):
         yield signal[i_start:i_end]
 
 def energy(samples):
-    return np.sum(np.power(samples, 2.)) / float(len(samples))
+    return np.sum(np.power(samples, 2.0)) / float(len(samples))
 
 def rising_edges(binary_signal):
     previous_value = 0
@@ -53,92 +41,101 @@ def rising_edges(binary_signal):
         previous_value = x
         index += 1
 
-'''
-Last Acceptable Values
+# ---------------------------------------------------
+# Streamlit UI
+# ---------------------------------------------------
 
-min_silence_length = 0.3
-silence_threshold = 1e-3
-step_duration = 0.03/10
+st.title("Audio Silence-Based Splitter")
 
-'''
-# Change the arguments and the input file here
-input_file = 'C:\\Teste\\06072012-19775-P01.wav'
-output_dir = 'C:\\Teste\\'
-min_silence_length = 0.6  # The minimum length of silence at which a split may occur [seconds]. Defaults to 3 seconds.
-silence_threshold = 1e-4  # The energy level (between 0.0 and 1.0) below which the signal is regarded as silent.
-step_duration = 0.03/10   # The amount of time to step forward in the input file after calculating energy. Smaller value = slower, but more accurate silence detection. Larger value = faster, but might miss some split opportunities. Defaults to (min-silence-length / 10.).
+uploaded_file = st.file_uploader("Upload WAV file", type=["wav"])
 
+min_silence_length = st.number_input("Min Silence Length (seconds)", value=0.6)
+silence_threshold = st.number_input("Silence Energy Threshold", value=1e-4, format="%.6f")
+step_duration = st.number_input("Step Duration (seconds)", value=0.003)
 
-input_filename = input_file
-window_duration = min_silence_length
-if step_duration is None:
-    step_duration = window_duration / 10.
-else:
-    step_duration = step_duration
+if uploaded_file is not None:
+    st.success("File uploaded successfully!")
 
-output_filename_prefix = os.path.splitext(os.path.basename(input_filename))[0]
-dry_run = False
+    # Save uploaded file safely for Streamlit Cloud
+    temp_dir = "/tmp" if not os.path.exists("temp") else "temp"
+    os.makedirs(temp_dir, exist_ok=True)
+    input_path = os.path.join(temp_dir, "input.wav")
 
-print("Splitting {} where energy is below {}% for longer than {}s.".format(
-    input_filename,
-    silence_threshold * 100.,
-    window_duration
-    )
-)
+    with open(input_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
 
-# Read and split the file
+    # Output directory
+    output_dir = os.path.join(temp_dir, "splits")
+    os.makedirs(output_dir, exist_ok=True)
 
-sample_rate, samples = input_data=wavfile.read(filename=input_filename, mmap=True)
+    st.write("Processing...")
 
-max_amplitude = np.iinfo(samples.dtype).max
-print(max_amplitude)
+    # ---------------------------------------------------
+    # Silence Detection + Splitting
+    # ---------------------------------------------------
+    sample_rate, samples = wavfile.read(input_path, mmap=True)
 
-max_energy = energy([max_amplitude])
-print(max_energy)
+    max_amplitude = np.iinfo(samples.dtype).max
+    max_energy = energy([max_amplitude])
 
-window_size = int(window_duration * sample_rate)
-step_size = int(step_duration * sample_rate)
+    window_size = int(min_silence_length * sample_rate)
+    step_size = int(step_duration * sample_rate)
 
-signal_windows = windows(
-    signal=samples,
-    window_size=window_size,
-    step_size=step_size
-)
+    signal_windows = windows(samples, window_size, step_size)
 
-window_energy = (energy(w) / max_energy for w in tqdm(
-    signal_windows,
-    total=int(len(samples) / float(step_size))
-))
+    window_energy = (energy(w) / max_energy for w in tqdm(
+        signal_windows,
+        total=int(len(samples) / float(step_size))
+    ))
 
-window_silence = (e > silence_threshold for e in window_energy)
+    window_silence = (e > silence_threshold for e in window_energy)
 
-cut_times = (r * step_duration for r in rising_edges(window_silence))
+    cut_times = (r * step_duration for r in rising_edges(window_silence))
 
-# This is the step that takes long, since we force the generators to run.
-print("Finding silences...")
-cut_samples = [int(t * sample_rate) for t in cut_times]
-cut_samples.append(-1)
+    cut_samples = [int(t * sample_rate) for t in cut_times]
+    cut_samples.append(-1)
 
-cut_ranges = [(i, cut_samples[i], cut_samples[i+1]) for i in range(len(cut_samples) - 1)]
+    cut_ranges = [(i, cut_samples[i], cut_samples[i + 1]) for i in range(len(cut_samples) - 1)]
 
-video_sub = {str(i) : [str(GetTime(((cut_samples[i])/sample_rate))), 
-                       str(GetTime(((cut_samples[i+1])/sample_rate)))] 
-             for i in range(len(cut_samples) - 1)}
+    base_name = uploaded_file.name.replace(".wav", "")
+    video_sub = {
+        str(i): [
+            GetTime(cut_samples[i] / sample_rate),
+            GetTime(cut_samples[i + 1] / sample_rate)
+        ]
+        for i in range(len(cut_samples) - 1)
+    }
 
-for i, start, stop in tqdm(cut_ranges):
-    output_file_path = "{}_{:03d}.wav".format(
-        os.path.join(output_dir, output_filename_prefix),
-        i
-    )
-    if not dry_run:
-        print("Writing file {}".format(output_file_path))
-        wavfile.write(
-            filename=output_file_path,
-            rate=sample_rate,
-            data=samples[start:stop]
+    st.write("Splitting audio...")
+
+    output_files = []
+
+    for i, start, stop in tqdm(cut_ranges):
+        output_file_path = os.path.join(output_dir, f"{base_name}_{i:03d}.wav")
+        wavfile.write(output_file_path, sample_rate, samples[start:stop])
+        output_files.append(output_file_path)
+
+    # Write JSON
+    json_path = os.path.join(output_dir, base_name + ".json")
+    with open(json_path, "w") as output_json:
+        json.dump(video_sub, output_json)
+
+    st.success("Audio successfully split!")
+
+    # Provide download links
+    st.subheader("Download Files")
+
+    for fpath in output_files[:10]:   # Show first 10
+        with open(fpath, "rb") as fp:
+            st.download_button(
+                label=f"Download {os.path.basename(fpath)}",
+                data=fp,
+                file_name=os.path.basename(fpath)
+            )
+
+    with open(json_path, "rb") as fp:
+        st.download_button(
+            label="Download JSON File",
+            data=fp,
+            file_name=os.path.basename(json_path)
         )
-    else:
-        print("Not writing file {}".format(output_file_path))
-        
-with open (output_dir+'\\'+output_filename_prefix+'.json', 'w') as output:
-    json.dump(video_sub, output)
